@@ -13,7 +13,9 @@ import utils
 import os
 from html import escape
 import requests
-
+from blockonomics import Blockonomics
+from websocket import create_connection
+import time
 
 class StopSignal:
     """A data class that should be sent to the worker when the conversation has to be stopped abnormally."""
@@ -221,6 +223,149 @@ class ChatWorker(threading.Thread):
                 continue
             # Return the successfulpayment
             return update.message.successful_payment
+
+    def __poll_btc_address(self, address):
+        response = ""
+        # Create the keyboard with the cancel button
+        inline_keyboard = telegram.InlineKeyboardMarkup([[telegram.InlineKeyboardButton(strings.menu_cancel,callback_data="cart_cancel")]])
+        # Send a message containing the button to cancel or pay
+        self.bot.send_message(self.chat.id, "Payment recieved!\nYour account will be credited on confirmation."
+                                                    , reply_markup=inline_keyboard)
+        def cancel_thread(stop_event):
+            global response
+            while not stop_event.is_set():
+                # Wait for inline keyboard
+                stuff_complete = self.__wait_for_inlinekeyboard_callback()
+                # some check if stuff is complete
+                if stuff_complete:
+                    response = "Cancelled"
+                    stop_event.set()
+                    break
+
+        def __wait_for_confirm(stop_event):
+            global response
+            while True:
+                balance = Blockonomics.get_balance(address).json()
+                confirmed = float(balance["response"][0]["confirmed"])
+                unconfirmed = float(balance["response"][0]["confirmed"])
+                print(confirmed)
+                # Fetch the current transaction by address
+                dbsession = db.Session()
+                transaction = dbsession.query(db.BtcTransaction).filter(db.BtcTransaction.address == address).one_or_none()
+                # Check not processed
+                if transaction.status != 2:
+                    # Check the status
+                    if transaction.status == -1:
+                        current_time = datetime.datetime.now()
+                        timeout = 30
+                        # If timeout has passed, use new btc price
+                        if current_time - datetime.timedelta(minutes = timeout) > datetime.datetime.strptime(transaction.timestamp, '%Y-%m-%d %H:%M:%S.%f'):
+                            transaction.price = Blockonomics.fetch_new_btc_price()
+                        transaction.timestamp = current_time
+                        transaction.status = 0
+                    if confirmed > 0:
+                        # Convert satoshi to fiat
+                        received_btc = confirmed/1.0e8
+                        received_value = received_btc*transaction.price
+                        print ("Recieved "+str(received_value)+" "+configloader.config["Payments"]["currency"]+" on address "+address)
+
+                        # Add the credit to the user account
+                        user = dbsession.query(db.User).filter(db.User.user_id == transaction.user_id).one_or_none()
+                        user.credit += received_value
+                        # Update the value + status + timestamp for transaction in DB
+                        transaction.value += received_value
+                        transaction.status = 2
+                        # Add a transaction to list
+                        new_transaction = db.Transaction(user=user,
+                                                     value=received_value,
+                                                     satoshi=confirmed,
+                                                     provider="Bitcoin",
+                                                     notes = address)
+                        # Add and commit the transaction
+                        dbsession.add(new_transaction)
+                        dbsession.commit()
+                        response = "Confirmed"
+                        break
+                    else:
+                        # Not confirmed yet
+                        dbsession.commit()
+                        time.sleep(30)
+                        continue
+                else:
+                    # Already processed
+                    dbsession.commit()
+                    response = "Confirmed"
+                    break
+            stop_event.set()
+
+        def run_threads():
+            global response
+            # create a thread event
+            a_stop_event = threading.Event()
+            # start the cancel thread
+            t = threading.Thread(target=cancel_thread, args=[a_stop_event])
+            t.start()
+            # start the recieving thread
+            t = threading.Thread(target=__wait_for_confirm, args=[a_stop_event])
+            t.start()
+            # wait for an event
+            while not a_stop_event.is_set():
+                time.sleep(0.1)
+            print ("At least one thread is done")
+            print ( response )
+            return response
+        return_val = run_threads()
+        return return_val
+
+    def __wait_for_successfulbtcpayment(self, address, amount):
+        # Start the websocket
+        ws = create_connection("wss://www.blockonomics.co/payment/" + address)
+        print("Connected to websocket...")
+        response = ""
+        # Create the keyboard with the cancel button
+        inline_keyboard = telegram.InlineKeyboardMarkup([[telegram.InlineKeyboardButton(strings.menu_cancel,callback_data="cart_cancel")]])
+        # Send a message containing the button to cancel or pay
+        self.bot.send_message_markdown(self.chat.id, "To pay, send this amount:\n`" 
+                                                    + str(amount) 
+                                                    + "`\nto this bitcoin address:\n`" 
+                                                    + address + "`", reply_markup=inline_keyboard)
+        def cancel_thread(stop_event):
+            global response
+            while not stop_event.is_set():
+                # Wait for inline keyboard
+                stuff_complete = self.__wait_for_inlinekeyboard_callback()
+                # some check if stuff is complete
+                if stuff_complete:
+                    response = "Cancelled"
+                    stop_event.set()
+                    break
+
+        def __wait_for_websocket(stop_event):
+            global response
+            result =  ws.recv()
+            print("Received '%s'" % result)
+            response = "Received"
+            stop_event.set()
+
+        def run_threads():
+            global response
+            # create a thread event
+            a_stop_event = threading.Event()
+            # start the cancel thread
+            t = threading.Thread(target=cancel_thread, args=[a_stop_event])
+            t.start()
+            # start the recieving thread
+            t = threading.Thread(target=__wait_for_websocket, args=[a_stop_event])
+            t.start()
+            # wait for an event
+            while not a_stop_event.is_set():
+                time.sleep(0.1)
+            print ("At least one thread is done")
+            print ( response )
+            return response
+        return_val = run_threads()
+        ws.close()
+        return return_val
 
     def __wait_for_photo(self, cancellable: bool=False) -> typing.Union[typing.List[telegram.PhotoSize], CancelSignal]:
         """Continue getting updates until a photo is received, then return it."""
@@ -547,13 +692,16 @@ class ChatWorker(threading.Thread):
         # Telegram Payments
         if configloader.config["Credit Card"]["credit_card_token"] != "":
             keyboard.append([telegram.KeyboardButton(strings.menu_credit_card)])
+        # Bitcoin Payments
+        if configloader.config["Bitcoin"]["api_key"] != "":
+            keyboard.append([telegram.KeyboardButton(strings.menu_bitcoin)])
         # Keyboard: go back to the previous menu
         keyboard.append([telegram.KeyboardButton(strings.menu_cancel)])
         # Send the keyboard to the user
         self.bot.send_message(self.chat.id, strings.conversation_payment_method,
                               reply_markup=telegram.ReplyKeyboardMarkup(keyboard, one_time_keyboard=True))
         # Wait for a reply from the user
-        selection = self.__wait_for_specific_message([strings.menu_cash, strings.menu_credit_card, strings.menu_cancel])
+        selection = self.__wait_for_specific_message([strings.menu_cash, strings.menu_credit_card, strings.menu_bitcoin, strings.menu_cancel])
         # If the user has selected the Cash option...
         if selection == strings.menu_cash:
             # Go to the pay with cash function
@@ -563,6 +711,10 @@ class ChatWorker(threading.Thread):
         elif selection == strings.menu_credit_card:
             # Go to the pay with credit card function
             self.__add_credit_cc()
+        # If the user has selected the Bitcoin option...
+        elif selection == strings.menu_bitcoin:
+            # Go to the pay with bitcoin function
+            self.__add_credit_btc()
         # If the user has selected the Cancel option...
         elif selection == strings.menu_cancel:
             # Send him back to the previous menu
@@ -664,6 +816,92 @@ class ChatWorker(threading.Thread):
         # Add and commit the transaction
         self.session.add(transaction)
         self.session.commit()
+
+    def __add_credit_btc(self):
+        """Add money to the wallet through a bitcoin payment."""
+        # Check if user has payment waiting for confimations
+        dbsession = db.Session()
+        transaction = dbsession.query(db.BtcTransaction).filter(db.BtcTransaction.user_id == self.user.user_id).filter(db.BtcTransaction.status == 0).one_or_none()
+        if transaction:
+            # Poll the address for confirmations
+            successfulconfirm = self.__poll_btc_address(transaction.address)
+            if successfulconfirm == "Confirmed":
+                self.bot.send_message(self.chat.id, "Payment confirmed!\nYour account has been credited.")
+            else:
+                self.bot.send_message(self.chat.id, "Leaving payment. Return to Add Funds > Bitcoin after confirmation to recieve your account credit.")
+        else:
+            # Create a keyboard to be sent later
+            keyboard = [[telegram.KeyboardButton(str(utils.Price("10.00")))],
+                        [telegram.KeyboardButton(str(utils.Price("25.00")))],
+                        [telegram.KeyboardButton(str(utils.Price("50.00")))],
+                        [telegram.KeyboardButton(str(utils.Price("100.00")))],
+                        [telegram.KeyboardButton(strings.menu_cancel)]]
+            # Boolean variable to check if the user has cancelled the action
+            cancelled = False
+            raw_value = 0
+            # Loop used to continue asking if there's an error during the input
+            while not cancelled:
+                # Send the message and the keyboard
+                self.bot.send_message(self.chat.id, strings.payment_cc_amount,
+                                      reply_markup=telegram.ReplyKeyboardMarkup(keyboard, one_time_keyboard=True))
+                # Wait until a valid amount is sent
+                # TODO: check and debug the regex
+                selection = self.__wait_for_regex(r"([0-9]{1,3}(?:[.,][0-9]+)?|" + strings.menu_cancel + r")")
+                # If the user cancelled the action
+                if selection == strings.menu_cancel:
+                    # Exit the loop
+                    cancelled = True
+                    continue
+                raw_value = selection
+                # Convert the amount to an integer
+                value = utils.Price(selection)
+                break
+            # If the user cancelled the action...
+            else:
+                # Exit the function
+                return
+            # The amount is valid, fetch btc amount and address
+            btc_price = Blockonomics.fetch_new_btc_price()
+            satoshi_amount = int(1.0e8*float(raw_value)/float(btc_price))
+            btc_amount = satoshi_amount/1.0e8
+            # Check to re-use address
+            transaction = dbsession.query(db.BtcTransaction).filter(db.BtcTransaction.user_id == self.user.user_id).filter(db.BtcTransaction.status == -1).one_or_none()
+            if transaction:
+                btc_address = transaction.address
+                # Update btc_price, satoshi, currency, timestamp
+                transaction.btc_price = btc_price
+                transaction.satoshi = satoshi_amount
+                transaction.currency = configloader.config["Payments"]["currency"]
+                transaction.timestamp = datetime.datetime.now()
+            else:
+                btc_address = Blockonomics.new_address().json()["address"]
+                # Create a new database btc transaction
+                transaction = db.BtcTransaction(user_id=self.user.user_id,
+                                             price = btc_price,
+                                             value=0,
+                                             satoshi = satoshi_amount,
+                                             currency = configloader.config["Payments"]["currency"],
+                                             status = -1,
+                                             timestamp = datetime.datetime.now(),
+                                             address=btc_address)
+                #Add and commit the btc transaction
+                dbsession.add(transaction)
+            dbsession.commit()
+            # Wait for the bitcoin payment
+            successfulpayment = self.__wait_for_successfulbtcpayment(btc_address,btc_amount)
+            
+            if successfulpayment == "Received":
+                # Poll the address for confirmations
+                successfulconfirm = self.__poll_btc_address(btc_address)
+                if successfulconfirm == "Confirmed":
+                    self.bot.send_message(self.chat.id, "Payment confirmed!\nYour account has been credited.")
+                else:
+                    self.bot.send_message(self.chat.id, "Leaving payment. Return to Add Funds > Bitcoin after confirmation to recieve your account credit.")
+            else:
+                self.bot.send_message(self.chat.id, "Payment cancelled")
+            # successfulpayment = {"status": 0, "timestamp": 1578567378, "value": "100000", "txid": "WarningThisIsAGeneratedTestPaymentAndNotARealBitcoinTransaction"}
+            # self.bot.send_message(self.chat.id, "Payment recieved!\nYour account will be credited on confirmation.")
+        dbsession.commit()
 
     def __bot_info(self):
         """Send information about the bot."""
